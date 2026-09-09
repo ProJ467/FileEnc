@@ -9,6 +9,7 @@ import threading
 import base64
 import secrets
 import string
+import struct
 from pathlib import Path
 
 import tkinter as tk
@@ -22,35 +23,46 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
 # ============================================================
-# FileEnc 0.04V
+# FileEnc 0.05V
 # ============================================================
 
 APP_NAME = "FileEnc"
-APP_VERSION = "0.04V"
+APP_VERSION = "0.05V"
 
-# ------------------------------------------------------------
-# Old formats
-# ------------------------------------------------------------
+
+# ============================================================
+# File formats
+# ============================================================
 
 OLD_FILE_MAGIC = b"FILEENC01"
 OLD_FOLDER_MAGIC = b"FILEDIR01"
 
-# ------------------------------------------------------------
-# New AES-256-GCM formats
-# ------------------------------------------------------------
+FILE_MAGIC_V2 = b"FILEENC02"
+FOLDER_MAGIC_V2 = b"FILEDIR02"
 
-FILE_MAGIC = b"FILEENC02"
-FOLDER_MAGIC = b"FILEDIR02"
+# Current streaming/chunked format
+FILE_MAGIC = b"FILEENC03"
+FOLDER_MAGIC = b"FILEDIR03"
+
+
+# ============================================================
+# Crypto settings
+# ============================================================
 
 SALT_SIZE = 16
 NONCE_SIZE = 12
 
-AES_KEY_SIZE = 32
+AES_KEY_SIZE = 32              # 256 bits
+GCM_TAG_SIZE = 16
+
 PBKDF2_ITERATIONS = 600_000
+
+CHUNK_SIZE = 1024 * 1024       # 1 MiB
 
 MIN_PASSWORD_LENGTH = 8
 
 MAX_ZIP_ENTRIES = 100_000
+MAX_MEMBER_NAME_LENGTH = 4096
 
 
 # ============================================================
@@ -72,6 +84,14 @@ ACCENT_HOVER = "#5877E8"
 SUCCESS = "#55CC8A"
 DANGER = "#E0646A"
 WARNING = "#E2B85C"
+
+
+# ============================================================
+# Global state
+# ============================================================
+
+root = None
+status_label = None
 
 
 # ============================================================
@@ -105,12 +125,11 @@ def center_window(window, width, height):
 
 
 def set_status(text, color=TEXT_MUTED):
-    status_label.config(
-        text=text,
-        fg=color
-    )
-
-    root.update_idletasks()
+    if status_label is not None:
+        status_label.config(
+            text=text,
+            fg=color
+        )
 
 
 def unique_path(path):
@@ -139,15 +158,42 @@ def same_path(a, b):
             == Path(b).resolve()
         )
     except OSError:
-        return os.path.abspath(a) == os.path.abspath(b)
+        return (
+            os.path.abspath(a)
+            == os.path.abspath(b)
+        )
+
+
+def ask_overwrite(path):
+    path = Path(path)
+
+    if not path.exists():
+        return True
+
+    return messagebox.askyesno(
+        APP_NAME,
+        f"This path already exists:\n\n"
+        f"{path}\n\n"
+        "Overwrite it?",
+        parent=root
+    )
+
+
+def remove_path(path):
+    path = Path(path)
+
+    if not path.exists():
+        return
+
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
 
 
 def atomic_write(path, data):
     """
-    Write data to a temporary file and then replace
-    the destination.
-
-    This helps avoid incomplete output files.
+    Safely write bytes using a temporary file and os.replace().
     """
 
     path = Path(path)
@@ -168,7 +214,9 @@ def atomic_write(path, data):
             suffix=".tmp"
         ) as temp:
 
-            temp_path = Path(temp.name)
+            temp_path = Path(
+                temp.name
+            )
 
             temp.write(data)
             temp.flush()
@@ -180,32 +228,19 @@ def atomic_write(path, data):
         )
 
     except Exception:
-        if temp_path and temp_path.exists():
+        if temp_path is not None:
             try:
-                temp_path.unlink()
-            except OSError:
+                temp_path.unlink(
+                    missing_ok=True
+                )
+            except Exception:
                 pass
 
         raise
 
 
-def ask_overwrite(path):
-    path = Path(path)
-
-    if not path.exists():
-        return True
-
-    return messagebox.askyesno(
-        APP_NAME,
-        f"This file already exists:\n\n"
-        f"{path}\n\n"
-        "Overwrite it?",
-        parent=root
-    )
-
-
 # ============================================================
-# Password strength
+# Password helpers
 # ============================================================
 
 def password_strength(password):
@@ -221,26 +256,26 @@ def password_strength(password):
         score += 1
 
     if any(
-        character.islower()
-        for character in password
+        c.islower()
+        for c in password
     ):
         score += 1
 
     if any(
-        character.isupper()
-        for character in password
+        c.isupper()
+        for c in password
     ):
         score += 1
 
     if any(
-        character.isdigit()
-        for character in password
+        c.isdigit()
+        for c in password
     ):
         score += 1
 
     if any(
-        character in string.punctuation
-        for character in password
+        c in string.punctuation
+        for c in password
     ):
         score += 1
 
@@ -254,6 +289,9 @@ def password_strength(password):
 
 
 def generate_password(length=20):
+    if length < 12:
+        length = 12
+
     alphabet = (
         string.ascii_letters
         + string.digits
@@ -286,33 +324,21 @@ def ask_password(
     window = tk.Toplevel(root)
 
     window.title(title)
-    window.configure(
-        bg=BG
-    )
-
-    window.resizable(
-        False,
-        False
-    )
+    window.configure(bg=BG)
+    window.resizable(False, False)
 
     window.transient(root)
     window.grab_set()
 
-    height = 380 if confirm else 330
-
     center_window(
         window,
         470,
-        height
+        380 if confirm else 330
     )
 
     result = {
         "password": None
     }
-
-    # --------------------------------------------------------
-    # Card
-    # --------------------------------------------------------
 
     card = tk.Frame(
         window,
@@ -328,10 +354,6 @@ def ask_password(
         pady=12
     )
 
-    # --------------------------------------------------------
-    # Title
-    # --------------------------------------------------------
-
     tk.Label(
         card,
         text=title,
@@ -341,10 +363,6 @@ def ask_password(
     ).pack(
         pady=(18, 15)
     )
-
-    # --------------------------------------------------------
-    # Password label
-    # --------------------------------------------------------
 
     tk.Label(
         card,
@@ -356,10 +374,6 @@ def ask_password(
         anchor="w",
         padx=28
     )
-
-    # --------------------------------------------------------
-    # Password entry
-    # --------------------------------------------------------
 
     password_entry = tk.Entry(
         card,
@@ -378,10 +392,6 @@ def ask_password(
         pady=(5, 6),
         ipady=8
     )
-
-    # --------------------------------------------------------
-    # Strength
-    # --------------------------------------------------------
 
     strength_label = tk.Label(
         card,
@@ -411,10 +421,6 @@ def ask_password(
         "<KeyRelease>",
         update_strength
     )
-
-    # --------------------------------------------------------
-    # Confirm password
-    # --------------------------------------------------------
 
     confirm_entry = None
 
@@ -447,10 +453,6 @@ def ask_password(
             pady=(5, 12),
             ipady=8
         )
-
-    # --------------------------------------------------------
-    # Options
-    # --------------------------------------------------------
 
     options = tk.Frame(
         card,
@@ -540,10 +542,6 @@ def ask_password(
         side="right"
     )
 
-    # --------------------------------------------------------
-    # Buttons
-    # --------------------------------------------------------
-
     buttons = tk.Frame(
         card,
         bg=CARD
@@ -572,10 +570,6 @@ def ask_password(
             return
 
         if require_strong:
-            strength, _ = password_strength(
-                password
-            )
-
             if len(password) < MIN_PASSWORD_LENGTH:
                 messagebox.showwarning(
                     APP_NAME,
@@ -586,15 +580,19 @@ def ask_password(
                 password_entry.focus_set()
                 return
 
+            strength, _ = password_strength(
+                password
+            )
+
             if strength == "Weak":
-                use_stronger = messagebox.askyesno(
+                use_anyway = messagebox.askyesno(
                     APP_NAME,
                     "This password is weak.\n\n"
-                    "Use a stronger password?",
+                    "Use it anyway?",
                     parent=window
                 )
 
-                if use_stronger:
+                if not use_anyway:
                     password_entry.focus_set()
                     return
 
@@ -609,7 +607,6 @@ def ask_password(
                 return
 
         result["password"] = password
-
         window.destroy()
 
     tk.Button(
@@ -684,10 +681,14 @@ def make_key(password, salt):
 
 
 # ============================================================
-# AES-256-GCM
+# AES-256-GCM: Full V2 format
 # ============================================================
 
-def aes_encrypt(data, password, magic):
+def aes_encrypt_full(
+    data,
+    password,
+    magic
+):
     salt = os.urandom(
         SALT_SIZE
     )
@@ -701,7 +702,7 @@ def aes_encrypt(data, password, magic):
         salt
     )
 
-    encrypted = AESGCM(
+    ciphertext = AESGCM(
         key
     ).encrypt(
         nonce,
@@ -713,11 +714,11 @@ def aes_encrypt(data, password, magic):
         magic
         + salt
         + nonce
-        + encrypted
+        + ciphertext
     )
 
 
-def aes_decrypt(
+def aes_decrypt_full(
     data,
     password,
     magic
@@ -726,19 +727,31 @@ def aes_decrypt(
         magic
     ):
         raise ValueError(
-            "Invalid FileEnc AES format."
+            "Invalid FileEnc V2 format."
+        )
+
+    header_size = (
+        len(magic)
+        + SALT_SIZE
+        + NONCE_SIZE
+    )
+
+    if len(data) <= header_size + GCM_TAG_SIZE - 1:
+        raise ValueError(
+            "FileEnc V2 data is incomplete."
         )
 
     salt_start = len(magic)
-    salt_end = salt_start + SALT_SIZE
+    salt_end = (
+        salt_start
+        + SALT_SIZE
+    )
 
     nonce_start = salt_end
-    nonce_end = nonce_start + NONCE_SIZE
-
-    if len(data) <= nonce_end:
-        raise ValueError(
-            "FileEnc data is incomplete or corrupted."
-        )
+    nonce_end = (
+        nonce_start
+        + NONCE_SIZE
+    )
 
     salt = data[
         salt_start:salt_end
@@ -769,15 +782,261 @@ def aes_decrypt(
     except InvalidTag:
         raise ValueError(
             "Wrong password or corrupted "
-            "FileEnc file."
+            "FileEnc V2 file."
         )
+
+
+# ============================================================
+# AES-256-GCM: Chunked V3 format
+# ============================================================
+
+def aes_encrypt_stream(
+    in_path,
+    out_path,
+    password,
+    magic
+):
+    """
+    FileEnc 03 format:
+
+        MAGIC
+        SALT
+
+        repeated:
+            4-byte big-endian plaintext length
+            12-byte nonce
+            ciphertext + 16-byte GCM tag
+
+        4-byte zero terminator
+
+    The explicit chunk length fixes the old framing bug.
+    """
+
+    salt = os.urandom(
+        SALT_SIZE
+    )
+
+    key = make_key(
+        password,
+        salt
+    )
+
+    aesgcm = AESGCM(
+        key
+    )
+
+    with open(
+        in_path,
+        "rb"
+    ) as source, open(
+        out_path,
+        "wb"
+    ) as destination:
+
+        destination.write(
+            magic
+        )
+
+        destination.write(
+            salt
+        )
+
+        while True:
+            chunk = source.read(
+                CHUNK_SIZE
+            )
+
+            if not chunk:
+                break
+
+            if len(chunk) > CHUNK_SIZE:
+                raise ValueError(
+                    "Internal chunk size error."
+                )
+
+            nonce = os.urandom(
+                NONCE_SIZE
+            )
+
+            ciphertext = aesgcm.encrypt(
+                nonce,
+                chunk,
+                magic
+            )
+
+            destination.write(
+                struct.pack(
+                    ">I",
+                    len(chunk)
+                )
+            )
+
+            destination.write(
+                nonce
+            )
+
+            destination.write(
+                ciphertext
+            )
+
+        # End marker
+        destination.write(
+            struct.pack(
+                ">I",
+                0
+            )
+        )
+
+
+def aes_decrypt_stream(
+    in_path,
+    out_path,
+    password,
+    magic
+):
+    """
+    Decrypt FileEnc 03.
+
+    Every chunk tells us its exact plaintext length,
+    so the next nonce can never be swallowed accidentally.
+    """
+
+    with open(
+        in_path,
+        "rb"
+    ) as source:
+
+        header = source.read(
+            len(magic)
+        )
+
+        if header != magic:
+            raise ValueError(
+                "Invalid FileEnc 03 format."
+            )
+
+        salt = source.read(
+            SALT_SIZE
+        )
+
+        if len(salt) != SALT_SIZE:
+            raise ValueError(
+                "FileEnc file is truncated."
+            )
+
+        key = make_key(
+            password,
+            salt
+        )
+
+        aesgcm = AESGCM(
+            key
+        )
+
+        total_plaintext = 0
+        saw_terminator = False
+
+        with open(
+            out_path,
+            "wb"
+        ) as destination:
+
+            while True:
+                length_bytes = source.read(
+                    4
+                )
+
+                if len(length_bytes) != 4:
+                    raise ValueError(
+                        "FileEnc file is truncated "
+                        "or missing its end marker."
+                    )
+
+                plaintext_length = struct.unpack(
+                    ">I",
+                    length_bytes
+                )[0]
+
+                # End marker
+                if plaintext_length == 0:
+                    saw_terminator = True
+                    break
+
+                if plaintext_length > CHUNK_SIZE:
+                    raise ValueError(
+                        "Invalid chunk length."
+                    )
+
+                nonce = source.read(
+                    NONCE_SIZE
+                )
+
+                if len(nonce) != NONCE_SIZE:
+                    raise ValueError(
+                        "FileEnc chunk is truncated."
+                    )
+
+                ciphertext_length = (
+                    plaintext_length
+                    + GCM_TAG_SIZE
+                )
+
+                ciphertext = source.read(
+                    ciphertext_length
+                )
+
+                if len(ciphertext) != ciphertext_length:
+                    raise ValueError(
+                        "FileEnc ciphertext chunk is truncated."
+                    )
+
+                try:
+                    plaintext = aesgcm.decrypt(
+                        nonce,
+                        ciphertext,
+                        magic
+                    )
+
+                except InvalidTag:
+                    raise ValueError(
+                        "Wrong password or corrupted "
+                        "FileEnc data."
+                    )
+
+                if len(plaintext) != plaintext_length:
+                    raise ValueError(
+                        "Decrypted chunk length mismatch."
+                    )
+
+                destination.write(
+                    plaintext
+                )
+
+                total_plaintext += (
+                    plaintext_length
+                )
+
+            if not saw_terminator:
+                raise ValueError(
+                    "FileEnc end marker missing."
+                )
+
+        # There must be absolutely nothing after the terminator.
+        trailing = source.read(1)
+
+        if trailing:
+            raise ValueError(
+                "Unexpected data found after FileEnc end marker."
+            )
+
+    return total_plaintext
 
 
 # ============================================================
 # Legacy Fernet support
 # ============================================================
 
-def legacy_decrypt(
+def legacy_decrypt_full(
     data,
     password,
     magic
@@ -790,7 +1049,11 @@ def legacy_decrypt(
         )
 
     salt_start = len(magic)
-    salt_end = salt_start + SALT_SIZE
+
+    salt_end = (
+        salt_start
+        + SALT_SIZE
+    )
 
     if len(data) <= salt_end:
         raise ValueError(
@@ -828,45 +1091,30 @@ def legacy_decrypt(
         )
 
 
-def decrypt_any(
-    data,
-    password,
-    new_magic,
-    old_magic
-):
-    if data.startswith(
-        new_magic
-    ):
-        return aes_decrypt(
-            data,
-            password,
-            new_magic
-        )
-
-    if data.startswith(
-        old_magic
-    ):
-        return legacy_decrypt(
-            data,
-            password,
-            old_magic
-        )
-
-    raise ValueError(
-        "Unknown FileEnc format."
-    )
-
+# ============================================================
+# Format detection
+# ============================================================
 
 def detect_format(data):
     if data.startswith(
         FILE_MAGIC
     ):
-        return "AES-256-GCM file"
+        return "AES-256-GCM Chunked file"
 
     if data.startswith(
         FOLDER_MAGIC
     ):
-        return "AES-256-GCM folder"
+        return "AES-256-GCM Chunked folder"
+
+    if data.startswith(
+        FILE_MAGIC_V2
+    ):
+        return "AES-256-GCM Full file"
+
+    if data.startswith(
+        FOLDER_MAGIC_V2
+    ):
+        return "AES-256-GCM Full folder"
 
     if data.startswith(
         OLD_FILE_MAGIC
@@ -879,6 +1127,96 @@ def detect_format(data):
         return "Legacy Fernet folder"
 
     return "Unknown"
+
+
+# ============================================================
+# Decrypt V3 to file
+# ============================================================
+
+def decrypt_to_path(
+    source,
+    output,
+    password
+):
+    source_path = Path(source)
+    output_path = Path(output)
+
+    with open(
+        source_path,
+        "rb"
+    ) as source_file:
+
+        header = source_file.read(
+            32
+        )
+
+    if header.startswith(
+        FILE_MAGIC
+    ):
+        temp_output = output_path.with_name(
+            "." + output_path.name + ".tmp"
+        )
+
+        try:
+            aes_decrypt_stream(
+                source_path,
+                temp_output,
+                password,
+                FILE_MAGIC
+            )
+
+            os.replace(
+                temp_output,
+                output_path
+            )
+
+        except Exception:
+            temp_output.unlink(
+                missing_ok=True
+            )
+            raise
+
+        return "AES-256-GCM Chunked"
+
+    if header.startswith(
+        FILE_MAGIC_V2
+    ):
+        data = source_path.read_bytes()
+
+        decrypted = aes_decrypt_full(
+            data,
+            password,
+            FILE_MAGIC_V2
+        )
+
+        atomic_write(
+            output_path,
+            decrypted
+        )
+
+        return "AES-256-GCM Full"
+
+    if header.startswith(
+        OLD_FILE_MAGIC
+    ):
+        data = source_path.read_bytes()
+
+        decrypted = legacy_decrypt_full(
+            data,
+            password,
+            OLD_FILE_MAGIC
+        )
+
+        atomic_write(
+            output_path,
+            decrypted
+        )
+
+        return "Legacy Fernet"
+
+    raise ValueError(
+        "Unknown FileEnc file format."
+    )
 
 
 # ============================================================
@@ -950,71 +1288,81 @@ def encrypt_file():
     ):
         return
 
-    try:
+    def task():
         set_status(
             "Encrypting with AES-256-GCM...",
             ACCENT
         )
 
-        with open(
-            source_path,
-            "rb"
-        ) as file:
-            original = file.read()
-
-        encrypted = aes_encrypt(
-            original,
-            password,
-            FILE_MAGIC
+        temp_output = output_path.with_name(
+            "." + output_path.name + ".tmp"
         )
 
-        atomic_write(
-            output_path,
-            encrypted
-        )
-
-        # Verify result
-        with open(
-            output_path,
-            "rb"
-        ) as file:
-            saved = file.read()
-
-        verified = aes_decrypt(
-            saved,
-            password,
-            FILE_MAGIC
-        )
-
-        if verified != original:
-            raise ValueError(
-                "Verification failed."
+        try:
+            aes_encrypt_stream(
+                source_path,
+                temp_output,
+                password,
+                FILE_MAGIC
             )
 
-        set_status(
-            "Ready",
-            SUCCESS
-        )
+            # Replace destination only after complete write.
+            os.replace(
+                temp_output,
+                output_path
+            )
 
-        messagebox.showinfo(
-            APP_NAME,
-            "Encryption successful! ✅\n\n"
-            "Algorithm: AES-256-GCM\n\n"
-            f"Saved to:\n{output_path}",
-            parent=root
-        )
+        finally:
+            temp_output.unlink(
+                missing_ok=True
+            )
 
-    except Exception as error:
-        set_status(
-            "Encryption failed",
-            DANGER
-        )
+    def worker():
+        try:
+            task()
 
-        messagebox.showerror(
-            "Encryption error",
-            str(error),
-            parent=root
-        )
+            def success():
+                set_status(
+                    "Ready",
+                    SUCCESS
+                )
+
+                messagebox.showinfo(
+                    APP_NAME,
+                    "Encryption successful! ✅\n\n"
+                    "Algorithm: AES-256-GCM\n"
+                    f"Saved to:\n{output_path}",
+                    parent=root
+                )
+
+            root.after(
+                0,
+                success
+            )
+
+        except Exception as error:
+
+            def failure():
+                set_status(
+                    "Encryption failed",
+                    DANGER
+                )
+
+                messagebox.showerror(
+                    "Encryption error",
+                    str(error),
+                    parent=root
+                )
+
+            root.after(
+                0,
+                failure
+            )
+
+    threading.Thread(
+        target=worker,
+        daemon=True
+    ).start()
 
 
 # ============================================================
@@ -1090,7 +1438,7 @@ def encrypt_replace_file():
     confirm_delete = messagebox.askyesno(
         "Confirm Encrypt & Replace",
         "The original file will be deleted ONLY "
-        "after successful encryption and verification.\n\n"
+        "after successful encryption.\n\n"
         f"Original:\n{source_path}\n\n"
         f"Encrypted:\n{output_path}\n\n"
         "Continue?",
@@ -1101,73 +1449,113 @@ def encrypt_replace_file():
     if not confirm_delete:
         return
 
-    try:
-        set_status(
-            "Encrypting and verifying...",
-            ACCENT
+    def worker():
+        temp_output = output_path.with_name(
+            "." + output_path.name + ".tmp"
         )
 
-        with open(
-            source_path,
-            "rb"
-        ) as file:
-            original = file.read()
-
-        encrypted = aes_encrypt(
-            original,
-            password,
-            FILE_MAGIC
-        )
-
-        atomic_write(
-            output_path,
-            encrypted
-        )
-
-        with open(
-            output_path,
-            "rb"
-        ) as file:
-            saved = file.read()
-
-        verified = aes_decrypt(
-            saved,
-            password,
-            FILE_MAGIC
-        )
-
-        if verified != original:
-            raise ValueError(
-                "Verification failed."
+        try:
+            set_status(
+                "Encrypting and verifying...",
+                ACCENT
             )
 
-        source_path.unlink()
+            aes_encrypt_stream(
+                source_path,
+                temp_output,
+                password,
+                FILE_MAGIC
+            )
 
-        set_status(
-            "Ready",
-            SUCCESS
-        )
+            # Verify by decrypting to a second temp file.
+            verify_output = output_path.with_name(
+                "." + output_path.name + ".verify"
+            )
 
-        messagebox.showinfo(
-            APP_NAME,
-            "Encrypt & Replace completed! ✅\n\n"
-            "The encrypted file was verified.\n"
-            "The original file was removed.",
-            parent=root
-        )
+            try:
+                aes_decrypt_stream(
+                    temp_output,
+                    verify_output,
+                    password,
+                    FILE_MAGIC
+                )
 
-    except Exception as error:
-        set_status(
-            "Encrypt & Replace failed",
-            DANGER
-        )
+                if not verify_output.exists():
+                    raise ValueError(
+                        "Verification output was not created."
+                    )
 
-        messagebox.showerror(
-            "Encrypt & Replace error",
-            "The original file was kept.\n\n"
-            + str(error),
-            parent=root
-        )
+                if (
+                    verify_output.stat().st_size
+                    != source_path.stat().st_size
+                ):
+                    raise ValueError(
+                        "Verification size mismatch."
+                    )
+
+                verify_output.unlink(
+                    missing_ok=True
+                )
+
+            finally:
+                verify_output.unlink(
+                    missing_ok=True
+                )
+
+            os.replace(
+                temp_output,
+                output_path
+            )
+
+            # Only now delete the source.
+            source_path.unlink()
+
+            def success():
+                set_status(
+                    "Ready",
+                    SUCCESS
+                )
+
+                messagebox.showinfo(
+                    APP_NAME,
+                    "Encrypt & Replace completed! ✅\n\n"
+                    "The encrypted file was verified.\n"
+                    "The original file was removed.",
+                    parent=root
+                )
+
+            root.after(
+                0,
+                success
+            )
+
+        except Exception as error:
+            temp_output.unlink(
+                missing_ok=True
+            )
+
+            def failure():
+                set_status(
+                    "Encrypt & Replace failed",
+                    DANGER
+                )
+
+                messagebox.showerror(
+                    "Encrypt & Replace error",
+                    "The original file was kept.\n\n"
+                    + str(error),
+                    parent=root
+                )
+
+            root.after(
+                0,
+                failure
+            )
+
+    threading.Thread(
+        target=worker,
+        daemon=True
+    ).start()
 
 
 # ============================================================
@@ -1242,59 +1630,73 @@ def decrypt_file():
         )
         return
 
-    if not ask_overwrite(
-        output_path
-    ):
-        return
+    if output_path.exists():
+        if not ask_overwrite(
+            output_path
+        ):
+            return
 
-    try:
-        set_status(
-            "Decrypting...",
-            ACCENT
-        )
+    def worker():
+        try:
+            set_status(
+                "Decrypting...",
+                ACCENT
+            )
 
-        with open(
-            source_path,
-            "rb"
-        ) as file:
-            encrypted = file.read()
+            format_name = decrypt_to_path(
+                source_path,
+                output_path,
+                password
+            )
 
-        decrypted = decrypt_any(
-            encrypted,
-            password,
-            FILE_MAGIC,
-            OLD_FILE_MAGIC
-        )
+            def success():
+                set_status(
+                    "Ready",
+                    SUCCESS
+                )
 
-        atomic_write(
-            output_path,
-            decrypted
-        )
+                messagebox.showinfo(
+                    APP_NAME,
+                    "Decryption successful! ✅\n\n"
+                    f"Format: {format_name}\n"
+                    f"Saved to:\n{output_path}",
+                    parent=root
+                )
 
-        set_status(
-            "Ready",
-            SUCCESS
-        )
+            root.after(
+                0,
+                success
+            )
 
-        messagebox.showinfo(
-            APP_NAME,
-            "Decryption successful! ✅\n\n"
-            f"Format: {detect_format(encrypted)}\n\n"
-            f"Saved to:\n{output_path}",
-            parent=root
-        )
+        except Exception as error:
 
-    except Exception as error:
-        set_status(
-            "Decryption failed",
-            DANGER
-        )
+            def failure():
+                try:
+                    if output_path.exists():
+                        output_path.unlink()
+                except Exception:
+                    pass
 
-        messagebox.showerror(
-            "Decryption error",
-            str(error),
-            parent=root
-        )
+                set_status(
+                    "Decryption failed",
+                    DANGER
+                )
+
+                messagebox.showerror(
+                    "Decryption error",
+                    str(error),
+                    parent=root
+                )
+
+            root.after(
+                0,
+                failure
+            )
+
+    threading.Thread(
+        target=worker,
+        daemon=True
+    ).start()
 
 
 # ============================================================
@@ -1304,7 +1706,17 @@ def decrypt_file():
 def decrypt_replace_file():
     source = filedialog.askopenfilename(
         parent=root,
-        title="Select encrypted file"
+        title="Select encrypted file to decrypt and replace",
+        filetypes=[
+            (
+                "FileEnc files",
+                "*.fenc"
+            ),
+            (
+                "All files",
+                "*.*"
+            )
+        ]
     )
 
     if not source:
@@ -1359,15 +1771,16 @@ def decrypt_replace_file():
         )
         return
 
-    if not ask_overwrite(
-        output_path
-    ):
-        return
+    if output_path.exists():
+        if not ask_overwrite(
+            output_path
+        ):
+            return
 
     confirm_delete = messagebox.askyesno(
         "Confirm Decrypt & Replace",
-        "The encrypted original will be deleted ONLY "
-        "after successful decryption and verification.\n\n"
+        "The encrypted source will be deleted ONLY "
+        "after successful decryption.\n\n"
         f"Encrypted:\n{source_path}\n\n"
         f"Decrypted:\n{output_path}\n\n"
         "Continue?",
@@ -1378,109 +1791,120 @@ def decrypt_replace_file():
     if not confirm_delete:
         return
 
-    try:
-        set_status(
-            "Decrypting and verifying...",
-            ACCENT
-        )
-
-        with open(
-            source_path,
-            "rb"
-        ) as file:
-            encrypted = file.read()
-
-        decrypted = decrypt_any(
-            encrypted,
-            password,
-            FILE_MAGIC,
-            OLD_FILE_MAGIC
-        )
-
-        atomic_write(
-            output_path,
-            decrypted
-        )
-
-        with open(
-            output_path,
-            "rb"
-        ) as file:
-            written = file.read()
-
-        if written != decrypted:
-            raise ValueError(
-                "Verification failed."
+    def worker():
+        try:
+            set_status(
+                "Decrypting and verifying...",
+                ACCENT
             )
 
-        source_path.unlink()
+            source_format = decrypt_to_path(
+                source_path,
+                output_path,
+                password
+            )
 
-        set_status(
-            "Ready",
-            SUCCESS
-        )
+            # Additional size check against the source
+            # is useful for detecting an incomplete result.
+            # It does not replace GCM authentication.
+            if not output_path.exists():
+                raise ValueError(
+                    "Decrypted output was not created."
+                )
 
-        messagebox.showinfo(
-            APP_NAME,
-            "Decrypt & Replace completed! ✅\n\n"
-            "The decrypted file was verified.\n"
-            "The encrypted original was removed.",
-            parent=root
-        )
+            source_path.unlink()
 
-    except Exception as error:
-        set_status(
-            "Decrypt & Replace failed",
-            DANGER
-        )
+            def success():
+                set_status(
+                    "Ready",
+                    SUCCESS
+                )
 
-        messagebox.showerror(
-            "Decrypt & Replace error",
-            "The encrypted original was kept.\n\n"
-            + str(error),
-            parent=root
-        )
+                messagebox.showinfo(
+                    APP_NAME,
+                    "Decrypt & Replace completed! ✅\n\n"
+                    f"Format: {source_format}\n"
+                    "The decrypted file was created.\n"
+                    "The encrypted original was removed.",
+                    parent=root
+                )
+
+            root.after(
+                0,
+                success
+            )
+
+        except Exception as error:
+
+            def failure():
+                try:
+                    if output_path.exists():
+                        output_path.unlink()
+                except Exception:
+                    pass
+
+                set_status(
+                    "Decrypt & Replace failed",
+                    DANGER
+                )
+
+                messagebox.showerror(
+                    "Decrypt & Replace error",
+                    "The encrypted original was kept.\n\n"
+                    + str(error),
+                    parent=root
+                )
+
+            root.after(
+                0,
+                failure
+            )
+
+    threading.Thread(
+        target=worker,
+        daemon=True
+    ).start()
 
 
 # ============================================================
-# Folder -> ZIP
+# Folder -> ZIP on disk
 # ============================================================
 
-def folder_to_zip(folder):
-    memory = io.BytesIO()
-
+def folder_to_zip_disk(
+    folder,
+    zip_path
+):
     base = Path(
         folder
-    )
+    ).resolve()
 
     with zipfile.ZipFile(
-        memory,
+        zip_path,
         "w",
-        zipfile.ZIP_DEFLATED
+        compression=zipfile.ZIP_DEFLATED
     ) as archive:
 
         for current_root, directories, files in os.walk(
-            folder
+            base
         ):
             current_root = Path(
                 current_root
             )
 
-            # Preserve empty directories
+            # Empty directories
             for directory in directories:
                 directory_path = (
-                    current_root
-                    / directory
+                    current_root / directory
                 )
 
                 try:
-                    empty = not any(
+                    is_empty = not any(
                         directory_path.iterdir()
                     )
                 except OSError:
-                    empty = False
+                    is_empty = False
 
-                if empty:
+                if is_empty:
                     relative = (
                         directory_path.relative_to(
                             base
@@ -1488,7 +1912,9 @@ def folder_to_zip(folder):
                     )
 
                     archive.writestr(
-                        str(relative).replace(
+                        str(
+                            relative
+                        ).replace(
                             "\\",
                             "/"
                         ) + "/",
@@ -1498,8 +1924,7 @@ def folder_to_zip(folder):
             # Files
             for filename in files:
                 file_path = (
-                    current_root
-                    / filename
+                    current_root / filename
                 )
 
                 relative = (
@@ -1510,13 +1935,13 @@ def folder_to_zip(folder):
 
                 archive.write(
                     file_path,
-                    str(relative).replace(
+                    str(
+                        relative
+                    ).replace(
                         "\\",
                         "/"
                     )
                 )
-
-    return memory.getvalue()
 
 
 # ============================================================
@@ -1524,7 +1949,7 @@ def folder_to_zip(folder):
 # ============================================================
 
 def secure_extract(
-    zip_data,
+    zip_path,
     destination
 ):
     destination = Path(
@@ -1537,7 +1962,7 @@ def secure_extract(
     )
 
     with zipfile.ZipFile(
-        io.BytesIO(zip_data),
+        zip_path,
         "r"
     ) as archive:
 
@@ -1551,13 +1976,18 @@ def secure_extract(
         seen = set()
 
         for member in members:
+            name = member.filename
 
-            normalized = member.filename.replace(
+            if len(name) > MAX_MEMBER_NAME_LENGTH:
+                raise ValueError(
+                    "ZIP entry name is too long."
+                )
+
+            normalized = name.replace(
                 "\\",
                 "/"
             )
 
-            # Duplicate path
             if normalized in seen:
                 raise ValueError(
                     "Unsafe ZIP archive: "
@@ -1572,20 +2002,24 @@ def secure_extract(
                 normalized
             ).parts
 
-            # Absolute path
-            if (
-                normalized.startswith("/")
-                or (
-                    parts
-                    and ":" in parts[0]
-                )
-            ):
+            # Absolute Unix path
+            if normalized.startswith("/"):
                 raise ValueError(
                     "Unsafe ZIP archive: "
                     "absolute path detected."
                 )
 
-            # Directory traversal
+            # Windows drive path
+            if (
+                parts
+                and ":" in parts[0]
+            ):
+                raise ValueError(
+                    "Unsafe ZIP archive: "
+                    "absolute Windows path detected."
+                )
+
+            # Traversal
             if ".." in parts:
                 raise ValueError(
                     "Unsafe ZIP archive: "
@@ -1606,7 +2040,7 @@ def secure_extract(
                     "Unsafe ZIP archive."
                 )
 
-            # Symbolic link check
+            # Unix symbolic links
             unix_mode = (
                 member.external_attr >> 16
             ) & 0xFFFF
@@ -1637,10 +2071,6 @@ def seal_folder():
     if not source:
         return
 
-    source_path = Path(
-        source
-    )
-
     password = ask_password(
         "Seal folder",
         confirm=True,
@@ -1649,6 +2079,10 @@ def seal_folder():
 
     if password is None:
         return
+
+    source_path = Path(
+        source
+    )
 
     output = filedialog.asksaveasfilename(
         parent=root,
@@ -1693,91 +2127,160 @@ def seal_folder():
     ):
         return
 
-    try:
-        set_status(
-            "Packing folder...",
-            ACCENT
-        )
+    def worker():
+        zip_temp = None
+        encrypted_temp = None
 
-        zip_data = folder_to_zip(
-            source
-        )
-
-        set_status(
-            "Encrypting with AES-256-GCM...",
-            ACCENT
-        )
-
-        encrypted = aes_encrypt(
-            zip_data,
-            password,
-            FOLDER_MAGIC
-        )
-
-        atomic_write(
-            output_path,
-            encrypted
-        )
-
-        # Verify
-        with open(
-            output_path,
-            "rb"
-        ) as file:
-            saved = file.read()
-
-        verified = aes_decrypt(
-            saved,
-            password,
-            FOLDER_MAGIC
-        )
-
-        if verified != zip_data:
-            raise ValueError(
-                "Folder verification failed."
+        try:
+            set_status(
+                "Packing folder...",
+                ACCENT
             )
 
-        set_status(
-            "Ready",
-            SUCCESS
-        )
-
-        delete_original = messagebox.askyesno(
-            "Folder encrypted",
-            "The folder was encrypted and verified successfully.\n\n"
-            "Delete the original folder?",
-            icon="warning",
-            parent=root
-        )
-
-        if delete_original:
-            shutil.rmtree(
-                source
+            zip_temp = Path(
+                tempfile.mktemp(
+                    prefix="fileenc_",
+                    suffix=".zip"
+                )
             )
 
-        messagebox.showinfo(
-            APP_NAME,
-            "Folder sealed successfully! ✅\n\n"
-            "Algorithm: AES-256-GCM\n\n"
-            f"Saved to:\n{output_path}",
-            parent=root
-        )
+            encrypted_temp = output_path.with_name(
+                "." + output_path.name + ".tmp"
+            )
 
-    except Exception as error:
-        set_status(
-            "Folder encryption failed",
-            DANGER
-        )
+            folder_to_zip_disk(
+                source_path,
+                zip_temp
+            )
 
-        messagebox.showerror(
-            "Seal folder error",
-            str(error),
-            parent=root
-        )
+            set_status(
+                "Encrypting folder...",
+                ACCENT
+            )
+
+            aes_encrypt_stream(
+                zip_temp,
+                encrypted_temp,
+                password,
+                FOLDER_MAGIC
+            )
+
+            # Verify by decrypting the encrypted archive
+            verify_zip = Path(
+                tempfile.mktemp(
+                    prefix="fileenc_verify_",
+                    suffix=".zip"
+                )
+            )
+
+            try:
+                set_status(
+                    "Verifying folder...",
+                    ACCENT
+                )
+
+                aes_decrypt_stream(
+                    encrypted_temp,
+                    verify_zip,
+                    password,
+                    FOLDER_MAGIC
+                )
+
+                with zipfile.ZipFile(
+                    verify_zip,
+                    "r"
+                ) as archive:
+
+                    if len(
+                        archive.infolist()
+                    ) > MAX_ZIP_ENTRIES:
+                        raise ValueError(
+                            "Verification ZIP is invalid."
+                        )
+
+            finally:
+                verify_zip.unlink(
+                    missing_ok=True
+                )
+
+            os.replace(
+                encrypted_temp,
+                output_path
+            )
+
+            delete_original = messagebox.askyesno(
+                "Folder encrypted",
+                "The folder was encrypted and verified successfully.\n\n"
+                "Delete the original folder?",
+                icon="warning",
+                parent=root
+            )
+
+            if delete_original:
+                shutil.rmtree(
+                    source_path
+                )
+
+            def success():
+                set_status(
+                    "Ready",
+                    SUCCESS
+                )
+
+                messagebox.showinfo(
+                    APP_NAME,
+                    "Folder sealed successfully! ✅\n\n"
+                    "Algorithm: AES-256-GCM\n"
+                    f"Saved to:\n{output_path}",
+                    parent=root
+                )
+
+            root.after(
+                0,
+                success
+            )
+
+        except Exception as error:
+            encrypted_temp.unlink(
+                missing_ok=True
+            ) if encrypted_temp else None
+
+            def failure():
+                set_status(
+                    "Seal folder failed",
+                    DANGER
+                )
+
+                messagebox.showerror(
+                    "Seal folder error",
+                    str(error),
+                    parent=root
+                )
+
+            root.after(
+                0,
+                failure
+            )
+
+        finally:
+            if zip_temp:
+                zip_temp.unlink(
+                    missing_ok=True
+                )
+
+            if encrypted_temp:
+                encrypted_temp.unlink(
+                    missing_ok=True
+                )
+
+    threading.Thread(
+        target=worker,
+        daemon=True
+    ).start()
 
 
 # ============================================================
-# Seal folder and replace
+# Seal folder & Replace
 # ============================================================
 
 def seal_folder_replace():
@@ -1810,7 +2313,7 @@ def seal_folder_replace():
     if output_path.exists():
         overwrite = messagebox.askyesno(
             APP_NAME,
-            f"This encrypted folder already exists:\n\n"
+            f"The encrypted folder already exists:\n\n"
             f"{output_path}\n\n"
             "Overwrite it?",
             parent=root
@@ -1833,84 +2336,144 @@ def seal_folder_replace():
     if not confirm_delete:
         return
 
-    try:
-        set_status(
-            "Packing folder...",
-            ACCENT
-        )
+    def worker():
+        zip_temp = None
+        encrypted_temp = None
 
-        zip_data = folder_to_zip(
-            source_path
-        )
-
-        set_status(
-            "Encrypting with AES-256-GCM...",
-            ACCENT
-        )
-
-        encrypted = aes_encrypt(
-            zip_data,
-            password,
-            FOLDER_MAGIC
-        )
-
-        atomic_write(
-            output_path,
-            encrypted
-        )
-
-        set_status(
-            "Verifying encrypted folder...",
-            ACCENT
-        )
-
-        with open(
-            output_path,
-            "rb"
-        ) as file:
-            saved = file.read()
-
-        verified = aes_decrypt(
-            saved,
-            password,
-            FOLDER_MAGIC
-        )
-
-        if verified != zip_data:
-            raise ValueError(
-                "Verification failed."
+        try:
+            set_status(
+                "Packing folder...",
+                ACCENT
             )
 
-        shutil.rmtree(
-            source_path
-        )
+            zip_temp = Path(
+                tempfile.mktemp(
+                    prefix="fileenc_",
+                    suffix=".zip"
+                )
+            )
 
-        set_status(
-            "Ready",
-            SUCCESS
-        )
+            encrypted_temp = output_path.with_name(
+                "." + output_path.name + ".tmp"
+            )
 
-        messagebox.showinfo(
-            APP_NAME,
-            "Seal Folder & Replace completed! ✅\n\n"
-            "The encrypted folder was verified.\n"
-            "The original folder was removed.\n\n"
-            f"Created:\n{output_path}",
-            parent=root
-        )
+            folder_to_zip_disk(
+                source_path,
+                zip_temp
+            )
 
-    except Exception as error:
-        set_status(
-            "Seal & Replace failed",
-            DANGER
-        )
+            set_status(
+                "Encrypting and verifying...",
+                ACCENT
+            )
 
-        messagebox.showerror(
-            "Seal Folder & Replace error",
-            "The original folder was kept.\n\n"
-            + str(error),
-            parent=root
-        )
+            aes_encrypt_stream(
+                zip_temp,
+                encrypted_temp,
+                password,
+                FOLDER_MAGIC
+            )
+
+            verify_zip = Path(
+                tempfile.mktemp(
+                    prefix="fileenc_verify_",
+                    suffix=".zip"
+                )
+            )
+
+            try:
+                aes_decrypt_stream(
+                    encrypted_temp,
+                    verify_zip,
+                    password,
+                    FOLDER_MAGIC
+                )
+
+                if not verify_zip.exists():
+                    raise ValueError(
+                        "Verification failed."
+                    )
+
+                with zipfile.ZipFile(
+                    verify_zip,
+                    "r"
+                ) as archive:
+                    archive.testzip()
+
+            finally:
+                verify_zip.unlink(
+                    missing_ok=True
+                )
+
+            os.replace(
+                encrypted_temp,
+                output_path
+            )
+
+            shutil.rmtree(
+                source_path
+            )
+
+            def success():
+                set_status(
+                    "Ready",
+                    SUCCESS
+                )
+
+                messagebox.showinfo(
+                    APP_NAME,
+                    "Seal Folder & Replace completed! ✅\n\n"
+                    "The encrypted folder was verified.\n"
+                    "The original folder was removed.\n\n"
+                    f"Created:\n{output_path}",
+                    parent=root
+                )
+
+            root.after(
+                0,
+                success
+            )
+
+        except Exception as error:
+
+            if encrypted_temp:
+                encrypted_temp.unlink(
+                    missing_ok=True
+                )
+
+            def failure():
+                set_status(
+                    "Seal & Replace failed",
+                    DANGER
+                )
+
+                messagebox.showerror(
+                    "Seal Folder & Replace error",
+                    "The original folder was kept.\n\n"
+                    + str(error),
+                    parent=root
+                )
+
+            root.after(
+                0,
+                failure
+            )
+
+        finally:
+            if zip_temp:
+                zip_temp.unlink(
+                    missing_ok=True
+                )
+
+            if encrypted_temp:
+                encrypted_temp.unlink(
+                    missing_ok=True
+                )
+
+    threading.Thread(
+        target=worker,
+        daemon=True
+    ).start()
 
 
 # ============================================================
@@ -1936,10 +2499,6 @@ def unseal_folder():
     if not source:
         return
 
-    source_path = Path(
-        source
-    )
-
     password = ask_password(
         "Unseal folder"
     )
@@ -1954,6 +2513,10 @@ def unseal_folder():
 
     if not destination:
         return
+
+    source_path = Path(
+        source
+    )
 
     destination_path = Path(
         destination
@@ -1972,39 +2535,42 @@ def unseal_folder():
         / default_name
     )
 
-    try:
-        set_status(
-            "Decrypting folder...",
-            ACCENT
-        )
-
-        with open(
-            source_path,
-            "rb"
-        ) as file:
-            encrypted = file.read()
-
-        zip_data = decrypt_any(
-            encrypted,
-            password,
-            FOLDER_MAGIC,
-            OLD_FOLDER_MAGIC
-        )
-
-        set_status(
-            "Restoring folder...",
-            ACCENT
-        )
-
-        temp_folder = Path(
-            tempfile.mkdtemp(
-                prefix="fileenc_unseal_"
-            )
-        )
+    def worker():
+        temp_zip = None
+        temp_folder = None
 
         try:
+            set_status(
+                "Decrypting folder...",
+                ACCENT
+            )
+
+            temp_zip = Path(
+                tempfile.mktemp(
+                    prefix="fileenc_",
+                    suffix=".zip"
+                )
+            )
+
+            temp_folder = Path(
+                tempfile.mkdtemp(
+                    prefix="fileenc_restore_"
+                )
+            )
+
+            decrypt_any_folder_to_zip(
+                source_path,
+                temp_zip,
+                password
+            )
+
+            set_status(
+                "Checking archive...",
+                ACCENT
+            )
+
             secure_extract(
-                zip_data,
+                temp_zip,
                 temp_folder
             )
 
@@ -2015,41 +2581,135 @@ def unseal_folder():
 
             temp_folder = None
 
+            def success():
+                set_status(
+                    "Ready",
+                    SUCCESS
+                )
+
+                messagebox.showinfo(
+                    APP_NAME,
+                    "Folder restored successfully! ✅\n\n"
+                    f"Restored to:\n{output_folder}",
+                    parent=root
+                )
+
+            root.after(
+                0,
+                success
+            )
+
+        except Exception as error:
+
+            def failure():
+                set_status(
+                    "Unseal failed",
+                    DANGER
+                )
+
+                messagebox.showerror(
+                    "Unseal folder error",
+                    str(error),
+                    parent=root
+                )
+
+            root.after(
+                0,
+                failure
+            )
+
         finally:
-            if temp_folder is not None:
+            if temp_zip:
+                temp_zip.unlink(
+                    missing_ok=True
+                )
+
+            if temp_folder:
                 shutil.rmtree(
                     temp_folder,
                     ignore_errors=True
                 )
 
-        set_status(
-            "Ready",
-            SUCCESS
-        )
-
-        messagebox.showinfo(
-            APP_NAME,
-            "Folder restored successfully! ✅\n\n"
-            f"Format: {detect_format(encrypted)}\n\n"
-            f"Restored to:\n{output_folder}",
-            parent=root
-        )
-
-    except Exception as error:
-        set_status(
-            "Folder decryption failed",
-            DANGER
-        )
-
-        messagebox.showerror(
-            "Unseal folder error",
-            str(error),
-            parent=root
-        )
+    threading.Thread(
+        target=worker,
+        daemon=True
+    ).start()
 
 
 # ============================================================
-# Unseal folder and replace
+# Folder decryption helper
+# ============================================================
+
+def decrypt_any_folder_to_zip(
+    source,
+    output,
+    password
+):
+    with open(
+        source,
+        "rb"
+    ) as file:
+        header = file.read(
+            32
+        )
+
+    if header.startswith(
+        FOLDER_MAGIC
+    ):
+        return aes_decrypt_stream(
+            source,
+            output,
+            password,
+            FOLDER_MAGIC
+        )
+
+    if header.startswith(
+        FOLDER_MAGIC_V2
+    ):
+        data = Path(
+            source
+        ).read_bytes()
+
+        decrypted = aes_decrypt_full(
+            data,
+            password,
+            FOLDER_MAGIC_V2
+        )
+
+        atomic_write(
+            output,
+            decrypted
+        )
+
+        return len(decrypted)
+
+    if header.startswith(
+        OLD_FOLDER_MAGIC
+    ):
+        data = Path(
+            source
+        ).read_bytes()
+
+        decrypted = legacy_decrypt_full(
+            data,
+            password,
+            OLD_FOLDER_MAGIC
+        )
+
+        atomic_write(
+            output,
+            decrypted
+        )
+
+        return len(decrypted)
+
+    raise ValueError(
+        "Unknown FileEnc folder format."
+    )
+
+
+# ============================================================
+# Unseal folder & Replace
 # ============================================================
 
 def unseal_folder_replace():
@@ -2090,10 +2750,6 @@ def unseal_folder_replace():
             + "_restored"
         )
 
-    # --------------------------------------------------------
-    # The output may already exist
-    # --------------------------------------------------------
-
     if output_folder.exists():
         overwrite = messagebox.askyesno(
             APP_NAME,
@@ -2120,102 +2776,117 @@ def unseal_folder_replace():
     if not confirm_delete:
         return
 
-    temp_folder = None
-
-    try:
-        set_status(
-            "Reading encrypted folder...",
-            ACCENT
-        )
-
-        with open(
-            source_path,
-            "rb"
-        ) as file:
-            encrypted = file.read()
-
-        set_status(
-            "Decrypting with AES-256-GCM...",
-            ACCENT
-        )
-
-        zip_data = decrypt_any(
-            encrypted,
-            password,
-            FOLDER_MAGIC,
-            OLD_FOLDER_MAGIC
-        )
-
-        set_status(
-            "Restoring folder...",
-            ACCENT
-        )
-
-        temp_folder = Path(
-            tempfile.mkdtemp(
-                prefix="fileenc_unseal_"
-            )
-        )
-
-        secure_extract(
-            zip_data,
-            temp_folder
-        )
-
-        # If an old output exists, remove it now,
-        # but ONLY after successful decryption.
-        if output_folder.exists():
-            if output_folder.is_dir():
-                shutil.rmtree(
-                    output_folder
-                )
-            else:
-                output_folder.unlink()
-
-        shutil.move(
-            str(temp_folder),
-            str(output_folder)
-        )
-
+    def worker():
+        temp_zip = None
         temp_folder = None
 
-        # The encrypted file is deleted only after
-        # the restored folder has been moved successfully.
-        source_path.unlink()
-
-        set_status(
-            "Ready",
-            SUCCESS
-        )
-
-        messagebox.showinfo(
-            APP_NAME,
-            "Unseal Folder & Replace completed! ✅\n\n"
-            f"Restored to:\n{output_folder}\n\n"
-            "The encrypted .fencdir was removed.",
-            parent=root
-        )
-
-    except Exception as error:
-        set_status(
-            "Unseal & Replace failed",
-            DANGER
-        )
-
-        messagebox.showerror(
-            "Unseal Folder & Replace error",
-            "The encrypted source was kept "
-            "when possible.\n\n"
-            + str(error),
-            parent=root
-        )
-
-    finally:
-        if temp_folder is not None:
-            shutil.rmtree(
-                temp_folder,
-                ignore_errors=True
+        try:
+            set_status(
+                "Decrypting folder...",
+                ACCENT
             )
+
+            temp_zip = Path(
+                tempfile.mktemp(
+                    prefix="fileenc_",
+                    suffix=".zip"
+                )
+            )
+
+            temp_folder = Path(
+                tempfile.mkdtemp(
+                    prefix="fileenc_restore_"
+                )
+            )
+
+            decrypt_any_folder_to_zip(
+                source_path,
+                temp_zip,
+                password
+            )
+
+            set_status(
+                "Verifying archive...",
+                ACCENT
+            )
+
+            secure_extract(
+                temp_zip,
+                temp_folder
+            )
+
+            # Now we know decryption and extraction succeeded.
+            if output_folder.exists():
+                remove_path(
+                    output_folder
+                )
+
+            shutil.move(
+                str(temp_folder),
+                str(output_folder)
+            )
+
+            temp_folder = None
+
+            # Only now delete the encrypted source.
+            source_path.unlink()
+
+            def success():
+                set_status(
+                    "Ready",
+                    SUCCESS
+                )
+
+                messagebox.showinfo(
+                    APP_NAME,
+                    "Unseal Folder & Replace completed! ✅\n\n"
+                    f"Restored to:\n{output_folder}\n\n"
+                    "The encrypted .fencdir was removed.",
+                    parent=root
+                )
+
+            root.after(
+                0,
+                success
+            )
+
+        except Exception as error:
+
+            def failure():
+                set_status(
+                    "Unseal & Replace failed",
+                    DANGER
+                )
+
+                messagebox.showerror(
+                    "Unseal Folder & Replace error",
+                    "The encrypted source was kept "
+                    "when possible.\n\n"
+                    + str(error),
+                    parent=root
+                )
+
+            root.after(
+                0,
+                failure
+            )
+
+        finally:
+            if temp_zip:
+                temp_zip.unlink(
+                    missing_ok=True
+                )
+
+            if temp_folder:
+                shutil.rmtree(
+                    temp_folder,
+                    ignore_errors=True
+                )
+
+    threading.Thread(
+        target=worker,
+        daemon=True
+    ).start()
 
 
 # ============================================================
@@ -2252,93 +2923,195 @@ def verify_fileenc():
         source
     )
 
-    try:
-        set_status(
-            "Verifying FileEnc data...",
-            ACCENT
-        )
+    def worker():
+        try:
+            with open(
+                source_path,
+                "rb"
+            ) as file:
+                header = file.read(
+                    32
+                )
 
-        with open(
-            source_path,
-            "rb"
-        ) as file:
-            data = file.read()
+            set_status(
+                "Verifying...",
+                ACCENT
+            )
 
-        if data.startswith(
-            FILE_MAGIC
-        ):
-            aes_decrypt(
-                data,
-                password,
+            if header.startswith(
                 FILE_MAGIC
-            )
+            ):
+                temp_output = Path(
+                    tempfile.mktemp(
+                        prefix="fileenc_verify_"
+                    )
+                )
 
-            kind = "AES-256-GCM encrypted file"
+                try:
+                    size = aes_decrypt_stream(
+                        source_path,
+                        temp_output,
+                        password,
+                        FILE_MAGIC
+                    )
+                finally:
+                    temp_output.unlink(
+                        missing_ok=True
+                    )
 
-        elif data.startswith(
-            FOLDER_MAGIC
-        ):
-            aes_decrypt(
-                data,
-                password,
+                kind = "Chunked encrypted file"
+
+            elif header.startswith(
                 FOLDER_MAGIC
-            )
+            ):
+                temp_zip = Path(
+                    tempfile.mktemp(
+                        prefix="fileenc_verify_",
+                        suffix=".zip"
+                    )
+                )
 
-            kind = "AES-256-GCM encrypted folder"
+                try:
+                    aes_decrypt_stream(
+                        source_path,
+                        temp_zip,
+                        password,
+                        FOLDER_MAGIC
+                    )
 
-        elif data.startswith(
-            OLD_FILE_MAGIC
-        ):
-            legacy_decrypt(
-                data,
-                password,
+                    with zipfile.ZipFile(
+                        temp_zip,
+                        "r"
+                    ) as archive:
+                        if len(
+                            archive.infolist()
+                        ) > MAX_ZIP_ENTRIES:
+                            raise ValueError(
+                                "ZIP archive is invalid."
+                            )
+
+                        archive.testzip()
+
+                finally:
+                    temp_zip.unlink(
+                        missing_ok=True
+                    )
+
+                kind = "Chunked encrypted folder"
+
+            elif header.startswith(
+                FILE_MAGIC_V2
+            ):
+                data = source_path.read_bytes()
+
+                aes_decrypt_full(
+                    data,
+                    password,
+                    FILE_MAGIC_V2
+                )
+
+                kind = "AES-256-GCM full file"
+
+            elif header.startswith(
+                FOLDER_MAGIC_V2
+            ):
+                data = source_path.read_bytes()
+
+                decrypted = aes_decrypt_full(
+                    data,
+                    password,
+                    FOLDER_MAGIC_V2
+                )
+
+                with zipfile.ZipFile(
+                    io.BytesIO(decrypted),
+                    "r"
+                ) as archive:
+                    archive.testzip()
+
+                kind = "AES-256-GCM full folder"
+
+            elif header.startswith(
                 OLD_FILE_MAGIC
-            )
+            ):
+                data = source_path.read_bytes()
 
-            kind = "Legacy encrypted file"
+                legacy_decrypt_full(
+                    data,
+                    password,
+                    OLD_FILE_MAGIC
+                )
 
-        elif data.startswith(
-            OLD_FOLDER_MAGIC
-        ):
-            legacy_decrypt(
-                data,
-                password,
+                kind = "Legacy Fernet file"
+
+            elif header.startswith(
                 OLD_FOLDER_MAGIC
+            ):
+                data = source_path.read_bytes()
+
+                decrypted = legacy_decrypt_full(
+                    data,
+                    password,
+                    OLD_FOLDER_MAGIC
+                )
+
+                with zipfile.ZipFile(
+                    io.BytesIO(decrypted),
+                    "r"
+                ) as archive:
+                    archive.testzip()
+
+                kind = "Legacy Fernet folder"
+
+            else:
+                raise ValueError(
+                    "Unknown FileEnc format."
+                )
+
+            def success():
+                set_status(
+                    "Verification successful",
+                    SUCCESS
+                )
+
+                messagebox.showinfo(
+                    APP_NAME,
+                    "Verification successful! ✅\n\n"
+                    f"Type: {kind}\n"
+                    f"Format: {detect_format(header)}\n\n"
+                    "The password is correct and "
+                    "the data passed integrity checks.",
+                    parent=root
+                )
+
+            root.after(
+                0,
+                success
             )
 
-            kind = "Legacy encrypted folder"
+        except Exception as error:
 
-        else:
-            raise ValueError(
-                "Unknown FileEnc format."
+            def failure():
+                set_status(
+                    "Verification failed",
+                    DANGER
+                )
+
+                messagebox.showerror(
+                    "Verification failed",
+                    str(error),
+                    parent=root
+                )
+
+            root.after(
+                0,
+                failure
             )
 
-        set_status(
-            "Verification successful",
-            SUCCESS
-        )
-
-        messagebox.showinfo(
-            APP_NAME,
-            "Verification successful! ✅\n\n"
-            f"Type: {kind}\n"
-            f"Format: {detect_format(data)}\n\n"
-            "The password is correct and the "
-            "encrypted data passed integrity verification.",
-            parent=root
-        )
-
-    except Exception as error:
-        set_status(
-            "Verification failed",
-            DANGER
-        )
-
-        messagebox.showerror(
-            "Verification failed",
-            str(error),
-            parent=root
-        )
+    threading.Thread(
+        target=worker,
+        daemon=True
+    ).start()
 
 
 # ============================================================
@@ -2387,7 +3160,7 @@ def show_info():
                         "rb"
                     ) as file:
                         header = file.read(
-                            64
+                            32
                         )
 
                     file_type = detect_format(
@@ -2412,17 +3185,17 @@ def show_info():
 
         elif target.is_dir():
             total_size = 0
-            files_count = 0
-            folders_count = 0
+            file_count = 0
+            folder_count = 0
 
             for current_root, directories, files in os.walk(
                 target
             ):
-                folders_count += len(
+                folder_count += len(
                     directories
                 )
 
-                files_count += len(
+                file_count += len(
                     files
                 )
 
@@ -2438,8 +3211,8 @@ def show_info():
             text = (
                 f"Name:\n{target.name}\n\n"
                 f"Type:\nFolder\n\n"
-                f"Files:\n{files_count}\n\n"
-                f"Subfolders:\n{folders_count}\n\n"
+                f"Files:\n{file_count}\n\n"
+                f"Subfolders:\n{folder_count}\n\n"
                 f"Total size:\n"
                 f"{format_size(total_size)}\n\n"
                 f"Path:\n{target}"
@@ -2591,7 +3364,7 @@ def make_exe():
         pady=3
     )
 
-    status = tk.Label(
+    build_status = tk.Label(
         card,
         text="Ready.",
         bg=CARD,
@@ -2599,7 +3372,7 @@ def make_exe():
         font=("Segoe UI", 9)
     )
 
-    status.pack(
+    build_status.pack(
         pady=(20, 8)
     )
 
@@ -2633,8 +3406,6 @@ def make_exe():
     )
 
     def build():
-        # Tkinter variables are read BEFORE
-        # entering the worker thread.
         one_file = one_file_var.get()
         no_console = no_console_var.get()
 
@@ -2642,9 +3413,8 @@ def make_exe():
             state="disabled"
         )
 
-        status.config(
-            text="Checking PyInstaller...",
-            fg=TEXT_MUTED
+        build_status.config(
+            text="Checking PyInstaller..."
         )
 
         progress.start(10)
@@ -2667,7 +3437,7 @@ def make_exe():
                 if check.returncode != 0:
                     raise RuntimeError(
                         "PyInstaller is not installed.\n\n"
-                        "Install it with:\n"
+                        f"Install it with:\n"
                         f"{sys.executable} "
                         f"-m pip install pyinstaller"
                     )
@@ -2750,7 +3520,7 @@ def make_exe():
                 def success():
                     progress.stop()
 
-                    status.config(
+                    build_status.config(
                         text="Build complete! ✅",
                         fg=SUCCESS
                     )
@@ -2771,14 +3541,14 @@ def make_exe():
 
             except Exception as error:
 
-                def failed():
+                def failure():
                     progress.stop()
 
                     build_button.config(
                         state="normal"
                     )
 
-                    status.config(
+                    build_status.config(
                         text="Build failed.",
                         fg=DANGER
                     )
@@ -2791,7 +3561,7 @@ def make_exe():
 
                 root.after(
                     0,
-                    failed
+                    failure
                 )
 
             finally:
@@ -2828,7 +3598,7 @@ def reset_app():
         folder
     ).resolve()
 
-    # Safety: don't allow filesystem root.
+    # Refuse filesystem root.
     if folder_path.parent == folder_path:
         messagebox.showerror(
             APP_NAME,
@@ -2874,12 +3644,9 @@ def reset_app():
         for item in folder_path.iterdir():
 
             try:
-                if item.is_dir():
-                    shutil.rmtree(
-                        item
-                    )
-                else:
-                    item.unlink()
+                remove_path(
+                    item
+                )
 
                 deleted += 1
 
@@ -2930,7 +3697,7 @@ def reset_app():
 
 
 # ============================================================
-# Main window
+# Main Window
 # ============================================================
 
 root = tk.Tk()
@@ -2940,12 +3707,12 @@ root.title(
 )
 
 root.geometry(
-    "610x850"
+    "630x900"
 )
 
 root.minsize(
-    610,
-    850
+    630,
+    900
 )
 
 root.configure(
@@ -2954,7 +3721,7 @@ root.configure(
 
 
 # ============================================================
-# ttk
+# ttk style
 # ============================================================
 
 style = ttk.Style()
@@ -3023,7 +3790,7 @@ tk.Label(
 
 tk.Label(
     title_frame,
-    text="AES-256-GCM encryption utility",
+    text="AES-256-GCM file encryption utility",
     bg=BG,
     fg=TEXT_MUTED,
     font=("Segoe UI", 10)
@@ -3033,7 +3800,7 @@ tk.Label(
 
 
 # ============================================================
-# Version badge
+# Version
 # ============================================================
 
 tk.Label(
@@ -3066,7 +3833,7 @@ tk.Frame(
 
 
 # ============================================================
-# Main Card
+# Main card
 # ============================================================
 
 main_card = tk.Frame(
@@ -3093,7 +3860,7 @@ tk.Label(
 ).pack(
     anchor="w",
     padx=25,
-    pady=(22, 5)
+    pady=(22, 4)
 )
 
 tk.Label(
@@ -3105,7 +3872,7 @@ tk.Label(
 ).pack(
     anchor="w",
     padx=25,
-    pady=(0, 15)
+    pady=(0, 13)
 )
 
 
@@ -3180,7 +3947,7 @@ def add_button(
 
 
 # ============================================================
-# File buttons
+# File operations
 # ============================================================
 
 add_button(
@@ -3209,7 +3976,7 @@ add_button(
 
 
 # ============================================================
-# Folder buttons
+# Folder operations
 # ============================================================
 
 add_button(
@@ -3238,7 +4005,7 @@ add_button(
 
 
 # ============================================================
-# Utility buttons
+# Utilities
 # ============================================================
 
 add_button(
@@ -3268,7 +4035,7 @@ add_button(
 
 
 # ============================================================
-# Status panel
+# Status
 # ============================================================
 
 status_frame = tk.Frame(
@@ -3281,7 +4048,7 @@ status_frame = tk.Frame(
 status_frame.pack(
     fill="x",
     padx=25,
-    pady=(18, 15)
+    pady=(16, 15)
 )
 
 tk.Label(
@@ -3358,7 +4125,9 @@ tk.Label(
 tk.Label(
     security_frame,
     text=(
-        f"PBKDF2 iterations: {PBKDF2_ITERATIONS:,}"
+        f"PBKDF2 iterations: "
+        f"{PBKDF2_ITERATIONS:,}  •  "
+        f"Chunk: {format_size(CHUNK_SIZE)}"
     ),
     bg="#12161D",
     fg=TEXT_MUTED,
@@ -3371,9 +4140,7 @@ tk.Label(
 
 tk.Label(
     security_frame,
-    text=(
-        "No Registry • No Explorer integration"
-    ),
+    text="No Registry  •  No Explorer integration",
     bg="#12161D",
     fg=TEXT_MUTED,
     font=("Segoe UI", 8)
@@ -3421,7 +4188,7 @@ tk.Label(
 
 
 # ============================================================
-# Start
+# Run
 # ============================================================
 
 root.mainloop()
